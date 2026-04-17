@@ -184,6 +184,7 @@ def normalize_order(
     raw_order: Dict[str, Any],
     index: int,
     external_id_prefix: str,
+    default_currency: str,
     method_codes: set[str],
     default_method: Optional[str],
     type_codes: set[str],
@@ -195,6 +196,12 @@ def normalize_order(
     order: Dict[str, Any] = {}
 
     order["externalId"] = raw_order.get("externalId") or f"{external_id_prefix}-{index:04d}"
+    order["currency"] = default_currency
+    raw_currency = str(raw_order.get("currency") or "").strip().upper()
+    if raw_currency and raw_currency != default_currency:
+        warnings.append(
+            f"Currency '{raw_currency}' replaced with '{default_currency}'."
+        )
 
     for field in ("firstName", "lastName", "phone", "email", "customerComment"):
         if raw_order.get(field):
@@ -291,12 +298,17 @@ def main() -> int:
         return 1
 
     external_id_prefix = env.get("ORDER_EXTERNAL_ID_PREFIX", "mock-order")
+    default_currency = (env.get("ORDER_CURRENCY") or "KZT").strip().upper()
     timeout_seconds = int(env.get("REQUEST_TIMEOUT_SECONDS", "30"))
     delay_seconds = (
         args.delay
         if args.delay is not None
         else float(env.get("REQUEST_DELAY_SECONDS", "0.15"))
     )
+
+    if not default_currency:
+        print("ORDER_CURRENCY must not be empty.", file=sys.stderr)
+        return 1
 
     client = RetailCrmClient(base_url=base_url, api_key=api_key, timeout=timeout_seconds)
 
@@ -336,6 +348,7 @@ def main() -> int:
                 raw_order=raw_order,
                 index=index,
                 external_id_prefix=external_id_prefix,
+                default_currency=default_currency,
                 method_codes=method_codes,
                 default_method=default_method,
                 type_codes=type_codes,

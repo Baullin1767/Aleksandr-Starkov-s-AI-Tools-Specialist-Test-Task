@@ -31,8 +31,16 @@ create table if not exists public.retailcrm_orders (
     delivery jsonb not null default '{}'::jsonb,
     custom_fields jsonb not null default '{}'::jsonb,
     raw_order jsonb not null,
-    synced_at timestamptz not null default timezone('utc', now())
+    synced_at timestamptz not null default timezone('utc', now()),
+    telegram_alert_sent_at timestamptz,
+    telegram_alert_message_id bigint
 );
+
+alter table public.retailcrm_orders
+    add column if not exists telegram_alert_sent_at timestamptz;
+
+alter table public.retailcrm_orders
+    add column if not exists telegram_alert_message_id bigint;
 
 create index if not exists retailcrm_orders_number_idx
     on public.retailcrm_orders (number);

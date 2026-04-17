@@ -5,6 +5,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from html import escape as html_escape
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
@@ -246,6 +247,55 @@ class SupabaseClient:
             json_body=list(rows),
         )
 
+    def fetch_alert_state_map(self, order_ids: Sequence[Any]) -> Dict[int, Dict[str, Any]]:
+        normalized_ids = [int(order_id) for order_id in order_ids if order_id is not None]
+        if not normalized_ids:
+            return {}
+
+        data = self.http.request_json(
+            "GET",
+            f"{self.base_url}/rest/v1/{quote(self.table, safe='')}",
+            headers=self._auth_headers(),
+            query={
+                "select": "retailcrm_id,telegram_alert_sent_at,telegram_alert_message_id",
+                "retailcrm_id": f"in.({','.join(str(order_id) for order_id in normalized_ids)})",
+            },
+        )
+
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected Supabase alert-state response: {data}")
+
+        result: Dict[int, Dict[str, Any]] = {}
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            retailcrm_id = row.get("retailcrm_id")
+            if retailcrm_id is None:
+                continue
+            result[int(retailcrm_id)] = row
+        return result
+
+    def mark_telegram_alert_sent(
+        self,
+        retailcrm_id: int,
+        *,
+        sent_at: str,
+        message_id: Optional[int],
+    ) -> None:
+        self.http.request_json(
+            "PATCH",
+            f"{self.base_url}/rest/v1/{quote(self.table, safe='')}",
+            headers={
+                **self._auth_headers(include_content_profile=True),
+                "Prefer": "return=minimal",
+            },
+            query={"retailcrm_id": f"eq.{retailcrm_id}"},
+            json_body={
+                "telegram_alert_sent_at": sent_at,
+                "telegram_alert_message_id": message_id,
+            },
+        )
+
     def table_exists(self) -> bool:
         try:
             self.http.request_json(
@@ -307,8 +357,16 @@ create table if not exists {table_qualified_name} (
     delivery jsonb not null default '{{}}'::jsonb,
     custom_fields jsonb not null default '{{}}'::jsonb,
     raw_order jsonb not null,
-    synced_at timestamptz not null default timezone('utc', now())
+    synced_at timestamptz not null default timezone('utc', now()),
+    telegram_alert_sent_at timestamptz,
+    telegram_alert_message_id bigint
 );
+
+alter table {table_qualified_name}
+    add column if not exists telegram_alert_sent_at timestamptz;
+
+alter table {table_qualified_name}
+    add column if not exists telegram_alert_message_id bigint;
 
 create index if not exists {table}_number_idx
     on {table_qualified_name} (number);
@@ -353,6 +411,37 @@ $$;
         )
 
 
+class TelegramClient:
+    def __init__(self, bot_token: str, chat_id: str, timeout: int = 30) -> None:
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.http = JsonHttpClient(timeout=timeout)
+
+    def send_message(self, text: str) -> Optional[int]:
+        response = self.http.request_json(
+            "POST",
+            f"https://api.telegram.org/bot{quote(self.bot_token, safe='')}/sendMessage",
+            json_body={
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+        )
+
+        if not isinstance(response, dict) or not response.get("ok"):
+            raise RuntimeError(f"Unexpected Telegram response: {response}")
+
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return None
+
+        message_id = result.get("message_id")
+        if message_id is None:
+            return None
+        return int(message_id)
+
+
 def to_float(value: Any) -> Optional[float]:
     if value in (None, ""):
         return None
@@ -364,6 +453,105 @@ def to_float(value: Any) -> Optional[float]:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_bool_env(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def format_telegram_total(total_summ: Optional[float], currency: Optional[str]) -> str:
+    if total_summ is None:
+        return "Not specified"
+    if currency == "KZT":
+        return f"{total_summ:,.2f} KZT"
+    if currency:
+        return f"{total_summ:,.2f} {currency}"
+    return f"{total_summ:,.2f}"
+
+
+def build_customer_name(row: Dict[str, Any]) -> str:
+    return " ".join(
+        part.strip()
+        for part in [str(row.get("first_name") or "").strip(), str(row.get("last_name") or "").strip()]
+        if part and part.strip()
+    ) or "Unknown customer"
+
+
+def build_contact_label(row: Dict[str, Any]) -> str:
+    return str(row.get("phone") or row.get("email") or "No contact data")
+
+
+def build_schedule_label(row: Dict[str, Any]) -> str:
+    schedule_value = row.get("shipment_date") or row.get("created_at")
+    if not schedule_value:
+        return "Not specified"
+    schedule_name = "Shipment date" if row.get("shipment_date") else "Created at"
+    return f"{schedule_name}: {schedule_value}"
+
+
+def is_telegram_alert_candidate(row: Dict[str, Any], min_total_kzt: float) -> bool:
+    currency = str(row.get("currency") or "").upper()
+    total_summ = row.get("total_summ")
+    return currency == "KZT" and isinstance(total_summ, (int, float)) and total_summ >= min_total_kzt
+
+
+def build_telegram_alert_message(row: Dict[str, Any]) -> str:
+    order_number = row.get("number") or f"#{row.get('retailcrm_id')}"
+    retailcrm_id = row.get("retailcrm_id")
+    customer_name = build_customer_name(row)
+    total_label = format_telegram_total(row.get("total_summ"), row.get("currency"))
+    status = row.get("status") or "unknown"
+    contact_label = build_contact_label(row)
+    schedule_label = build_schedule_label(row)
+
+    lines = [
+        "<b>Large order alert</b>",
+        f"Order: <b>{html_escape(str(order_number))}</b> (RetailCRM ID: {html_escape(str(retailcrm_id))})",
+        f"Customer: {html_escape(customer_name)}",
+        f"Total: <b>{html_escape(total_label)}</b>",
+        f"Status: {html_escape(str(status))}",
+        html_escape(schedule_label),
+        f"Contact: {html_escape(contact_label)}",
+    ]
+    return "\n".join(lines)
+
+
+def send_telegram_alerts_for_batch(
+    *,
+    supabase: SupabaseClient,
+    telegram: TelegramClient,
+    rows: Sequence[Dict[str, Any]],
+    min_total_kzt: float,
+) -> int:
+    alert_state_map = supabase.fetch_alert_state_map([row.get("retailcrm_id") for row in rows])
+    alerts_sent = 0
+
+    for row in rows:
+        retailcrm_id = row.get("retailcrm_id")
+        if retailcrm_id is None or not is_telegram_alert_candidate(row, min_total_kzt):
+            continue
+
+        existing_state = alert_state_map.get(int(retailcrm_id), {})
+        if existing_state.get("telegram_alert_sent_at"):
+            continue
+
+        try:
+            message_id = telegram.send_message(build_telegram_alert_message(row))
+            supabase.mark_telegram_alert_sent(
+                int(retailcrm_id),
+                sent_at=utc_now_iso(),
+                message_id=message_id,
+            )
+            alerts_sent += 1
+        except Exception as exc:
+            print(
+                f"Telegram alert failed for order {retailcrm_id}: {exc}",
+                file=sys.stderr,
+            )
+
+    return alerts_sent
 
 
 def order_to_row(order: Dict[str, Any], synced_at: str) -> Dict[str, Any]:
@@ -529,9 +717,22 @@ def main() -> int:
         "SUPABASE_ANON_KEY",
         "SUPABASE_PUBLISHABLE_KEY",
     )
+    telegram_alerts_enabled = parse_bool_env(env.get("TELEGRAM_ALERTS_ENABLED"), default=False)
+    telegram_bot_token = env.get("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id = env.get("TELEGRAM_CHAT_ID")
+    telegram_min_total_kzt = float(env.get("TELEGRAM_ALERT_MIN_TOTAL_KZT", "50000"))
 
     if retailcrm_page_limit <= 0 or supabase_batch_size <= 0:
         print("RETAILCRM_PAGE_LIMIT and SUPABASE_BATCH_SIZE must be greater than 0.", file=sys.stderr)
+        return 1
+    if telegram_min_total_kzt < 0:
+        print("TELEGRAM_ALERT_MIN_TOTAL_KZT must be greater than or equal to 0.", file=sys.stderr)
+        return 1
+    if telegram_alerts_enabled and (not telegram_bot_token or not telegram_chat_id):
+        print(
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required when TELEGRAM_ALERTS_ENABLED=true.",
+            file=sys.stderr,
+        )
         return 1
 
     retailcrm = RetailCrmClient(
@@ -547,6 +748,15 @@ def main() -> int:
         table=supabase_table,
         conflict_column=supabase_conflict_column,
         timeout=request_timeout,
+    )
+    telegram = (
+        TelegramClient(
+            bot_token=telegram_bot_token,
+            chat_id=telegram_chat_id,
+            timeout=request_timeout,
+        )
+        if telegram_alerts_enabled and telegram_bot_token and telegram_chat_id
+        else None
     )
 
     if args.create_table:
@@ -583,6 +793,7 @@ def main() -> int:
     page = 1
     seen_orders = 0
     uploaded_rows = 0
+    telegram_alerts_sent = 0
     synced_at = utc_now_iso()
 
     while True:
@@ -628,6 +839,13 @@ def main() -> int:
                 for batch in chunked(rows, supabase_batch_size):
                     supabase.upsert_rows(batch)
                     uploaded_rows += len(batch)
+                    if telegram is not None:
+                        telegram_alerts_sent += send_telegram_alerts_for_batch(
+                            supabase=supabase,
+                            telegram=telegram,
+                            rows=batch,
+                            min_total_kzt=telegram_min_total_kzt,
+                        )
             except Exception as exc:
                 if is_rls_error(exc):
                     print(
@@ -647,7 +865,8 @@ def main() -> int:
         total_pages = pagination.get("totalPageCount", current_page)
         print(
             f"Processed RetailCRM page {current_page}/{total_pages}. "
-            f"Orders this page={len(rows)} total_synced={uploaded_rows}"
+            f"Orders this page={len(rows)} total_synced={uploaded_rows} "
+            f"telegram_alerts_sent={telegram_alerts_sent}"
         )
 
         if len(rows) < len(orders):
@@ -662,7 +881,8 @@ def main() -> int:
 
     print(
         f"Done. pages_processed={page if seen_orders else 0} "
-        f"orders_seen={seen_orders} orders_synced={uploaded_rows}"
+        f"orders_seen={seen_orders} orders_synced={uploaded_rows} "
+        f"telegram_alerts_sent={telegram_alerts_sent}"
     )
     return 0
 
