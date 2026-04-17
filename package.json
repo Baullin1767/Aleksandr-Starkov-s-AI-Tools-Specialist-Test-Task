@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "sync": "tsx sync_retailcrm_to_supabase.ts",
+    "upload": "tsx upload_orders_to_retailcrm.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.103.3",
@@ -17,6 +19,7 @@
     "@types/node": "^25.6.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "tsx": "^4.19.4",
     "typescript": "^6.0.3"
   }
 }

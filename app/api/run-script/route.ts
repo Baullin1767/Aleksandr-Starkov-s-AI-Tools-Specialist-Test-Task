@@ -1,35 +1,19 @@
-import { execFile } from "node:child_process";
-import { access } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import { NextResponse } from "next/server";
+import { run as runSync } from "../../../sync_retailcrm_to_supabase";
+import { run as runUpload } from "../../../upload_orders_to_retailcrm";
 
-const execFileAsync = promisify(execFile);
 export const runtime = "nodejs";
 export const maxDuration = 300;
-const routeDir = path.dirname(fileURLToPath(import.meta.url));
 
-const ALLOWED_SCRIPTS = {
-  upload_orders_to_retailcrm: {
-    label: "upload_orders_to_retailcrm.py",
-    absolutePath: path.resolve(routeDir, "../../../upload_orders_to_retailcrm.py"),
-  },
-  sync_retailcrm_to_supabase: {
-    label: "sync_retailcrm_to_supabase.py",
-    absolutePath: path.resolve(routeDir, "../../../sync_retailcrm_to_supabase.py"),
-  },
+const SCRIPT_LABELS = {
+  upload_orders_to_retailcrm: "upload_orders_to_retailcrm.ts",
+  sync_retailcrm_to_supabase: "sync_retailcrm_to_supabase.ts",
 } as const;
 
-type AllowedScriptName = keyof typeof ALLOWED_SCRIPTS;
+type AllowedScriptName = keyof typeof SCRIPT_LABELS;
 
 function isAllowedScriptName(value: unknown): value is AllowedScriptName {
-  return typeof value === "string" && value in ALLOWED_SCRIPTS;
-}
-
-function getPythonCommands(): string[] {
-  const configured = process.env.PYTHON_EXECUTABLE?.trim();
-  return configured ? [configured] : ["python3", "python"];
+  return typeof value === "string" && value in SCRIPT_LABELS;
 }
 
 export async function POST(request: Request) {
@@ -43,80 +27,44 @@ export async function POST(request: Request) {
 
   const scriptName = (payload as { script?: unknown })?.script;
   if (!isAllowedScriptName(scriptName)) {
-    return NextResponse.json({ error: "Unsupported script requested." }, { status: 400 });
-  }
-
-  const script = ALLOWED_SCRIPTS[scriptName];
-
-  try {
-    await access(script.absolutePath);
-  } catch {
     return NextResponse.json(
-      {
-        ok: false,
-        script: script.label,
-        message:
-          "The requested script is not available in the deployed server bundle. Check Next.js output file tracing settings.",
-      },
-      { status: 500 },
+      { error: "Unsupported script requested." },
+      { status: 400 },
     );
   }
 
+  const label = SCRIPT_LABELS[scriptName];
+  const stdoutLines: string[] = [];
+  const stderrLines: string[] = [];
+  const logger = {
+    log: (msg: string) => {
+      stdoutLines.push(msg);
+    },
+    error: (msg: string) => {
+      stderrLines.push(msg);
+    },
+  };
+
   try {
-    let lastError: unknown = null;
+    const { ok } =
+      scriptName === "sync_retailcrm_to_supabase"
+        ? await runSync({}, logger)
+        : await runUpload({}, logger);
 
-    for (const pythonCommand of getPythonCommands()) {
-      try {
-        const { stdout, stderr } = await execFileAsync(pythonCommand, [script.absolutePath], {
-          cwd: process.cwd(),
-          timeout: 10 * 60 * 1000,
-          maxBuffer: 1024 * 1024 * 4,
-        });
-
-        return NextResponse.json({
-          ok: true,
-          script: script.label,
-          stdout: stdout.trim(),
-          stderr: stderr.trim(),
-        });
-      } catch (error) {
-        lastError = error;
-
-        const errorCode =
-          typeof error === "object" && error !== null && "code" in error
-            ? String((error as { code?: unknown }).code ?? "")
-            : "";
-
-        if (errorCode !== "ENOENT") {
-          throw error;
-        }
-      }
-    }
-
-    throw lastError ?? new Error("No Python executable was found.");
+    return NextResponse.json({
+      ok,
+      script: label,
+      stdout: stdoutLines.join("\n"),
+      stderr: stderrLines.join("\n"),
+    });
   } catch (error) {
-    const details =
-      typeof error === "object" && error !== null
-        ? {
-            stdout: typeof (error as { stdout?: unknown }).stdout === "string"
-              ? (error as { stdout: string }).stdout.trim()
-              : "",
-            stderr: typeof (error as { stderr?: unknown }).stderr === "string"
-              ? (error as { stderr: string }).stderr.trim()
-              : "",
-            message: error instanceof Error ? error.message : "Unknown error",
-          }
-        : {
-            stdout: "",
-            stderr: "",
-            message: "Unknown error",
-          };
-
     return NextResponse.json(
       {
         ok: false,
-        script: script.label,
-        ...details,
+        script: label,
+        stdout: stdoutLines.join("\n"),
+        stderr: stderrLines.join("\n"),
+        message: error instanceof Error ? error.message : "Unknown error",
       },
       { status: 500 },
     );
