@@ -459,6 +459,9 @@ at Home (app\page.tsx:126:11)
 128 |       </section>
 129 |     </main>
 
+Create buttons insede web app what will launch upload_orders_to_retailcrm.py and sync_retailcrm_to_supabase. py.
+Add it to the top of the screen
+
 *plan-mode*
 Now add telegram integration i need get allert about orders more then 50,000 ₸ by telegram bot
 
