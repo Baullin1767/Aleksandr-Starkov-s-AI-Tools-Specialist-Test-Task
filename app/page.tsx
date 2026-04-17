@@ -6,6 +6,7 @@ import {
   getStatusOptions,
 } from "../lib/orders";
 import { OrdersCalendar } from "./orders-calendar";
+import { ScriptControls } from "./script-controls";
 
 export const dynamic = "force-dynamic";
 
@@ -53,6 +54,8 @@ export default async function Home({
 
   return (
     <main className="page-shell">
+      <ScriptControls />
+
       <section className="hero">
         <div>
           <p className="eyebrow">Supabase + Vercel</p>
