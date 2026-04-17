@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -45,17 +46,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_env(env_path: Path) -> Dict[str, str]:
-    if not env_path.exists():
-        raise FileNotFoundError(f"Env file not found: {env_path}")
-
     result: Dict[str, str] = {}
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
 
-        key, value = line.split("=", 1)
-        result[key.strip()] = value.strip().strip('"').strip("'")
+    if env_path.exists():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            result[key.strip()] = value.strip().strip('"').strip("'")
+
+    for key, value in os.environ.items():
+        if value:
+            result[key] = value
 
     return result
 
