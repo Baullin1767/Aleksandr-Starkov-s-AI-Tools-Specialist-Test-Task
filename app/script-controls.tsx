@@ -61,7 +61,7 @@ export function ScriptControls() {
     setStatus({
       type: "running",
       title: "Script is running",
-      output: "Please wait while the server executes the selected Python script.",
+      output: "Please wait while the server executes the selected script.",
     });
 
     startTransition(async () => {
